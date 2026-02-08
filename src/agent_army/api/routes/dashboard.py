@@ -26,12 +26,22 @@ async def get_stats() -> dict[str, Any]:
 
     stats = await _database.get_dashboard_stats()
 
-    # Add active agent count
+    # Add agent counts
     active_agents = 0
+    total_agents = 0
     if _orchestrator:
         active_agents = sum(1 for a in _orchestrator._agents if a.is_running)
+        total_agents = len(_orchestrator._agents)
 
     stats["active_agents"] = active_agents
+    stats["total_agents"] = total_agents
+    # Map field names to frontend expectations
+    stats["running_tasks"] = stats.pop("active_tasks", 0)
+    # Use the actual today count; remove total_prospects from response
+    stats.pop("total_prospects", None)
+    stats["llm_available"] = (
+        _orchestrator._llm_service is not None if _orchestrator else False
+    )
     return stats
 
 

@@ -5,8 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .routes import agents, dashboard, tasks, websocket
@@ -47,7 +48,17 @@ def create_app(
     # Serve React build if it exists
     dashboard_path = Path(__file__).parent.parent.parent.parent / "dashboard" / "dist"
     if dashboard_path.exists():
-        app.mount("/", StaticFiles(directory=str(dashboard_path), html=True), name="dashboard")
+        index_html = dashboard_path / "index.html"
+
+        # SPA catch-all: serve index.html for non-API routes (client-side routing)
+        @app.get("/{path:path}")
+        async def spa_fallback(request: Request, path: str) -> FileResponse:
+            # Serve static assets directly if they exist
+            file_path = dashboard_path / path
+            if file_path.is_file():
+                return FileResponse(file_path)
+            # Otherwise serve index.html for client-side routing
+            return FileResponse(index_html)
 
     # Register WebSocket handler with message bus
     if orchestrator and orchestrator._message_bus:

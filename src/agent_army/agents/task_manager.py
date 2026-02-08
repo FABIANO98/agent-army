@@ -293,9 +293,13 @@ class TaskManagerAgent(BaseAgent):
         completed_orders = set()
 
         subtasks = await self._db.get_subtasks(task_id)
+
+        # Build map of completed subtasks and their output_data
+        completed_output: dict[int, dict[str, Any]] = {}
         for st in subtasks:
             if st.status == TaskStatus.COMPLETED.value:
                 completed_orders.add(st.sequence_order)
+                completed_output[st.sequence_order] = st.output_data or {}
 
         for st in subtasks:
             if st.status != TaskStatus.PENDING.value:
@@ -303,6 +307,13 @@ class TaskManagerAgent(BaseAgent):
 
             deps = st.depends_on or []
             if all(d in completed_orders for d in deps):
+                # Collect output_data from all completed dependencies
+                input_data = st.input_data or {}
+                for dep_order in deps:
+                    dep_output = completed_output.get(dep_order, {})
+                    if dep_output:
+                        input_data.update(dep_output)
+
                 # Dispatch this subtask
                 await self._db.update_subtask(st.id, status=TaskStatus.IN_PROGRESS.value)
 
@@ -315,7 +326,7 @@ class TaskManagerAgent(BaseAgent):
                         "subtask_id": st.id,
                         "title": st.title,
                         "description": st.description,
-                        "input_data": st.input_data,
+                        "input_data": input_data,
                     },
                     priority="high",
                 )

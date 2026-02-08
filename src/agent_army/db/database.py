@@ -743,10 +743,18 @@ class Database:
                 select(func.count()).select_from(Prospect)
             )
 
+            # Prospects found today
+            prospects_today = await session.execute(
+                select(func.count())
+                .select_from(Prospect)
+                .where(Prospect.found_date >= today_start)
+            )
+
             return {
                 "active_tasks": active_tasks.scalar() or 0,
                 "total_tasks": total_tasks.scalar() or 0,
                 "pipeline_value": pipeline_value.scalar() or 0,
                 "emails_today": emails_today.scalar() or 0,
                 "total_prospects": total_prospects.scalar() or 0,
+                "prospects_today": prospects_today.scalar() or 0,
             }

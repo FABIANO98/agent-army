@@ -206,16 +206,22 @@ class ResearchManagerAgent(BaseAgent):
         self.log(f"Executing subtask #{subtask_id} for task #{task_id}")
 
         try:
-            if self._pending_prospects:
-                batch = self._pending_prospects[:self._max_per_batch]
+            # Get prospects from input_data (passed from ProspectFinder via TaskManager)
+            input_data = payload.get("input_data", {})
+            prospects = input_data.get("prospects", [])
+
+            # Also check internal queue as fallback
+            if not prospects and self._pending_prospects:
+                prospects = self._pending_prospects[:self._max_per_batch]
                 self._pending_prospects = self._pending_prospects[self._max_per_batch:]
-                results = []
-                for p in batch:
-                    profile = await self._research_prospect(p)
-                    if profile:
-                        results.append(profile)
-            else:
-                results = []
+
+            self.log(f"Researching {len(prospects)} prospects for subtask #{subtask_id}")
+
+            results = []
+            for p in prospects[:self._max_per_batch]:
+                profile = await self._research_prospect(p)
+                if profile:
+                    results.append(profile)
 
             await self.send_message(
                 recipient_id="task_manager",

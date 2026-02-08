@@ -260,7 +260,10 @@ class ProspectFinderAgent(BaseAgent):
         """
         # Try ZEFIX first
         if self._zefix:
-            return await self._search_via_zefix(industry, region)
+            results = await self._search_via_zefix(industry, region)
+            if results:
+                return results
+            self.log(f"ZEFIX returned no results for '{industry}' in {region}, using fallback")
 
         # Fallback to simulated results
         sample_companies = [
@@ -271,7 +274,7 @@ class ProspectFinderAgent(BaseAgent):
             },
             {
                 "name": f"{region.title()} {industry.title()} GmbH",
-                "url": f"https://{region.lower()}-{industry}.ch",
+                "url": f"https://{self._sanitize_url_part(region)}-{industry}.ch",
                 "snippet": f"Professionelle {industry.title()}-Dienstleistungen",
             },
             {
@@ -282,6 +285,18 @@ class ProspectFinderAgent(BaseAgent):
         ]
 
         return random.sample(sample_companies, min(len(sample_companies), random.randint(1, 3)))
+
+    # Industry-specific search terms for ZEFIX (which searches by company name)
+    _INDUSTRY_SEARCH_TERMS: dict[str, list[str]] = {
+        "bau": ["Bau", "Bauunternehmung", "Baugeschaeft", "Hochbau", "Tiefbau"],
+        "transport": ["Transport", "Transporte", "Spedition", "Logistik"],
+        "logistik": ["Logistik", "Lager", "Spedition", "Transport"],
+        "handwerk": ["Handwerk", "Schreinerei", "Schlosserei", "Malerei"],
+        "elektro": ["Elektro", "Elektriker", "Elektrotechnik"],
+        "sanitaer": ["Sanitaer", "Sanitär", "Heizung", "Haustechnik"],
+        "gastronomie": ["Restaurant", "Gastro", "Catering"],
+        "immobilien": ["Immobilien", "Liegenschaft", "Verwaltung"],
+    }
 
     async def _search_via_zefix(
         self, industry: str, region: str
@@ -299,30 +314,48 @@ class ProspectFinderAgent(BaseAgent):
         }
         canton = region_to_canton.get(region.lower())
 
-        companies = await self._zefix.search_companies(
-            name=industry,
-            canton=canton,
-            active_only=True,
-            max_results=10,
-        )
+        # Use industry-specific search terms instead of raw industry name
+        search_terms = self._INDUSTRY_SEARCH_TERMS.get(industry.lower(), [industry.title()])
 
         results = []
-        for c in companies:
-            name = c.get("name", "")
-            # Build a plausible URL from the company name
-            url_name = name.lower().replace(" ", "-").replace("&", "und")
-            url_name = re.sub(r"[^a-z0-9-]", "", url_name)
-            results.append({
-                "name": name,
-                "url": f"https://{url_name}.ch",
-                "snippet": c.get("purpose", ""),
-                "uid": c.get("uid", ""),
-                "canton": c.get("canton", ""),
-                "legal_form": c.get("legal_form", ""),
-            })
+        for term in search_terms:
+            companies = await self._zefix.search_companies(
+                name=term,
+                canton=canton,
+                active_only=True,
+                max_results=10,
+            )
+            for c in companies:
+                name = c.get("name", "")
+                url_name = self._sanitize_url_part(name)
+                results.append({
+                    "name": name,
+                    "url": f"https://{url_name}.ch",
+                    "snippet": c.get("purpose", ""),
+                    "uid": c.get("uid", ""),
+                    "canton": c.get("canton", ""),
+                    "legal_form": c.get("legal_form", ""),
+                })
+            if results:
+                break  # Got results, no need to try more terms
 
         self.log(f"ZEFIX found {len(results)} companies for '{industry}' in {canton or region}")
         return results
+
+    @staticmethod
+    def _sanitize_url_part(name: str) -> str:
+        """Sanitize a name for use in a URL, properly handling German umlauts."""
+        url_name = name.lower().replace(" ", "-").replace("&", "und")
+        # Replace German umlauts before stripping non-ascii
+        umlaut_map = {
+            "ä": "ae", "ö": "oe", "ü": "ue",
+            "Ä": "ae", "Ö": "oe", "Ü": "ue",
+            "ß": "ss",
+        }
+        for char, replacement in umlaut_map.items():
+            url_name = url_name.replace(char, replacement)
+        url_name = re.sub(r"[^a-z0-9-]", "", url_name)
+        return url_name
 
     async def _evaluate_prospect(
         self, result: dict[str, Any], industry: str, region: str

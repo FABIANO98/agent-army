@@ -27,7 +27,19 @@ async def list_agents() -> list[dict[str, Any]]:
     agents = []
     for agent in _orchestrator._agents:
         health = await agent.health_check()
-        agents.append(health)
+        metrics = health.get("metrics", {})
+        agents.append({
+            "agent_id": health.get("agent_id"),
+            "name": health.get("name"),
+            "agent_type": health.get("type"),
+            "status": health.get("status"),
+            "running": health.get("running"),
+            "queue_size": health.get("queue_size", 0),
+            "tasks_completed": metrics.get("tasks_completed", 0),
+            "success_rate": metrics.get("success_rate", 0),
+            "uptime": metrics.get("uptime_seconds", 0),
+            "errors": metrics.get("recent_errors", []),
+        })
     return agents
 
 
