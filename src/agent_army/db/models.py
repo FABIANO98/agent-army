@@ -341,6 +341,145 @@ class Deal(Base):
         }
 
 
+class TaskStatus(str, Enum):
+    """Status of a task."""
+
+    PENDING = "pending"
+    PLANNING = "planning"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class Task(Base):
+    """User-created task that gets decomposed into subtasks."""
+
+    __tablename__ = "tasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        String(50), default=TaskStatus.PENDING.value, index=True
+    )
+    priority: Mapped[int] = mapped_column(Integer, default=5)
+    plan: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    result_summary: Mapped[Optional[str]] = mapped_column(Text)
+    progress_pct: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=func.now(), onupdate=func.now()
+    )
+
+    subtasks: Mapped[list["Subtask"]] = relationship("Subtask", back_populates="task")
+    results: Mapped[list["TaskResult"]] = relationship("TaskResult", back_populates="task")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "description": self.description,
+            "status": self.status,
+            "priority": self.priority,
+            "plan": self.plan,
+            "result_summary": self.result_summary,
+            "progress_pct": self.progress_pct,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+        }
+
+
+class Subtask(Base):
+    """A subtask assigned to a specific agent."""
+
+    __tablename__ = "subtasks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(Integer, ForeignKey("tasks.id"), index=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    assigned_agent: Mapped[Optional[str]] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(
+        String(50), default=TaskStatus.PENDING.value, index=True
+    )
+    sequence_order: Mapped[int] = mapped_column(Integer, default=0)
+    depends_on: Mapped[Optional[list[int]]] = mapped_column(JSON)
+    input_data: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    output_data: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=func.now(), onupdate=func.now()
+    )
+
+    task: Mapped["Task"] = relationship("Task", back_populates="subtasks")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "title": self.title,
+            "description": self.description,
+            "assigned_agent": self.assigned_agent,
+            "status": self.status,
+            "sequence_order": self.sequence_order,
+            "depends_on": self.depends_on,
+            "input_data": self.input_data,
+            "output_data": self.output_data,
+        }
+
+
+class TaskResult(Base):
+    """Structured result from a completed task."""
+
+    __tablename__ = "task_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(Integer, ForeignKey("tasks.id"), index=True)
+    result_type: Mapped[str] = mapped_column(String(100), default="text")
+    title: Mapped[Optional[str]] = mapped_column(String(500))
+    data: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+    task: Mapped["Task"] = relationship("Task", back_populates="results")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "result_type": self.result_type,
+            "title": self.title,
+            "data": self.data,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AgentCommunication(Base):
+    """Logged inter-agent communication."""
+
+    __tablename__ = "agent_communications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    sender_agent: Mapped[str] = mapped_column(String(100), index=True)
+    receiver_agent: Mapped[str] = mapped_column(String(100))
+    message_type: Mapped[str] = mapped_column(String(100))
+    summary: Mapped[Optional[str]] = mapped_column(Text)
+    task_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("tasks.id"), nullable=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=func.now(), index=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "sender_agent": self.sender_agent,
+            "receiver_agent": self.receiver_agent,
+            "message_type": self.message_type,
+            "summary": self.summary,
+            "task_id": self.task_id,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+        }
+
+
 class AgentLog(Base):
     """
     Log entries from agents.

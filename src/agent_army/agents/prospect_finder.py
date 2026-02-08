@@ -20,6 +20,7 @@ from ..db.models import ProspectStatus
 if TYPE_CHECKING:
     from ..core.message_bus import MessageBus
     from ..core.registry import AgentRegistry
+    from ..scrapers.zefix_client import ZefixClient
     from ..utils.config import Settings
 
 
@@ -37,6 +38,7 @@ class ProspectFinderAgent(BaseAgent):
         registry: Optional[AgentRegistry] = None,
         database: Optional[Database] = None,
         settings: Optional[Settings] = None,
+        zefix_client: Optional[ZefixClient] = None,
     ) -> None:
         """Initialize ProspectFinder agent."""
         super().__init__(
@@ -47,6 +49,7 @@ class ProspectFinderAgent(BaseAgent):
         )
         self._db = database
         self._settings = settings
+        self._zefix = zefix_client
         self._http_client: Optional[httpx.AsyncClient] = None
         self._last_search_time: Optional[datetime] = None
         self._daily_count = 0
@@ -154,11 +157,43 @@ class ProspectFinderAgent(BaseAgent):
 
     async def process_message(self, message: Message) -> None:
         """Process incoming messages."""
-        if message.message_type == MessageType.HEALTH_CHECK.value:
+        if message.message_type == MessageType.TASK_ASSIGNED.value:
+            await self._execute_subtask(message.payload)
+
+        elif message.message_type == MessageType.HEALTH_CHECK.value:
             await self.send_message(
                 recipient_id=message.sender_id,
                 message_type=MessageType.HEALTH_RESPONSE.value,
                 payload=await self.health_check(),
+            )
+
+    async def _execute_subtask(self, payload: dict[str, Any]) -> None:
+        """Execute a subtask assigned by TaskManager."""
+        task_id = payload.get("task_id")
+        subtask_id = payload.get("subtask_id")
+        self.log(f"Executing subtask #{subtask_id} for task #{task_id}")
+
+        try:
+            prospects = await self._find_prospects()
+            await self.send_message(
+                recipient_id="task_manager",
+                message_type=MessageType.TASK_SUBTASK_COMPLETE.value,
+                payload={
+                    "task_id": task_id,
+                    "subtask_id": subtask_id,
+                    "output_data": {
+                        "type": "prospects",
+                        "title": f"{len(prospects)} Prospects gefunden",
+                        "prospects": prospects,
+                        "count": len(prospects),
+                    },
+                },
+            )
+        except Exception as e:
+            await self.send_message(
+                recipient_id="task_manager",
+                message_type=MessageType.TASK_FAILED.value,
+                payload={"task_id": task_id, "subtask_id": subtask_id, "error": str(e)},
             )
 
     async def _find_prospects(self) -> list[dict[str, Any]]:
@@ -220,18 +255,14 @@ class ProspectFinderAgent(BaseAgent):
         """
         Search for companies matching criteria.
 
-        In production, this would use Google Search API, Bing API, or similar.
-        For now, returns simulated results for demonstration.
-
-        Args:
-            industry: Target industry
-            region: Target region
-
-        Returns:
-            List of search results
+        Uses ZEFIX (Swiss commercial register) if available,
+        falls back to simulated results.
         """
-        # Simulated search results for demonstration
-        # In production, implement actual search API integration
+        # Try ZEFIX first
+        if self._zefix:
+            return await self._search_via_zefix(industry, region)
+
+        # Fallback to simulated results
         sample_companies = [
             {
                 "name": f"Müller {industry.title()} AG",
@@ -250,8 +281,48 @@ class ProspectFinderAgent(BaseAgent):
             },
         ]
 
-        # Add some randomization
         return random.sample(sample_companies, min(len(sample_companies), random.randint(1, 3)))
+
+    async def _search_via_zefix(
+        self, industry: str, region: str
+    ) -> list[dict[str, Any]]:
+        """Search for companies via ZEFIX API."""
+        if not self._zefix:
+            return []
+
+        # Map region to canton
+        region_to_canton = {
+            "zürich": "ZH", "zurich": "ZH", "bern": "BE", "basel": "BS",
+            "luzern": "LU", "lucerne": "LU", "st. gallen": "SG",
+            "aargau": "AG", "solothurn": "SO", "thurgau": "TG",
+            "zug": "ZG", "schaffhausen": "SH",
+        }
+        canton = region_to_canton.get(region.lower())
+
+        companies = await self._zefix.search_companies(
+            name=industry,
+            canton=canton,
+            active_only=True,
+            max_results=10,
+        )
+
+        results = []
+        for c in companies:
+            name = c.get("name", "")
+            # Build a plausible URL from the company name
+            url_name = name.lower().replace(" ", "-").replace("&", "und")
+            url_name = re.sub(r"[^a-z0-9-]", "", url_name)
+            results.append({
+                "name": name,
+                "url": f"https://{url_name}.ch",
+                "snippet": c.get("purpose", ""),
+                "uid": c.get("uid", ""),
+                "canton": c.get("canton", ""),
+                "legal_form": c.get("legal_form", ""),
+            })
+
+        self.log(f"ZEFIX found {len(results)} companies for '{industry}' in {canton or region}")
+        return results
 
     async def _evaluate_prospect(
         self, result: dict[str, Any], industry: str, region: str

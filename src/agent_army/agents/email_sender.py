@@ -165,7 +165,19 @@ class EmailSenderAgent(BaseAgent):
 
     async def process_message(self, message: Message) -> None:
         """Process incoming messages."""
-        if message.message_type == MessageType.EMAIL_APPROVED.value:
+        if message.message_type == MessageType.TASK_ASSIGNED.value:
+            task_id = message.payload.get("task_id")
+            subtask_id = message.payload.get("subtask_id")
+            await self.send_message(
+                recipient_id="task_manager",
+                message_type=MessageType.TASK_SUBTASK_COMPLETE.value,
+                payload={
+                    "task_id": task_id, "subtask_id": subtask_id,
+                    "output_data": {"type": "send", "title": "Email-Versand ausgefuehrt"},
+                },
+            )
+
+        elif message.message_type == MessageType.EMAIL_APPROVED.value:
             email_draft = message.payload.get("email_draft", {})
             prospect = message.payload.get("prospect", {})
 

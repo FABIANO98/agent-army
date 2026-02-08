@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .orchestrator import Orchestrator, run_orchestrator
+from .orchestrator import Orchestrator, run_orchestrator, run_orchestrator_with_web
 from .utils.config import create_default_config, load_config
 
 
@@ -249,6 +249,32 @@ def init(path: str) -> None:
     console.print("1. Edit the configuration file with your settings")
     console.print("2. Add your API keys and email credentials")
     console.print("3. Run 'agent-army start' to begin")
+
+
+@main.command()
+@click.option(
+    "--config", "-c",
+    type=click.Path(exists=False),
+    help="Path to configuration file",
+)
+@click.option(
+    "--port", "-p",
+    type=int,
+    default=8000,
+    help="Web server port",
+)
+def web(config: Optional[str], port: int) -> None:
+    """Start agents with web dashboard."""
+    console.print(Panel.fit(
+        "[bold cyan]Agent Army[/bold cyan]\n"
+        "Web Dashboard Mode",
+        border_style="cyan",
+    ))
+
+    try:
+        asyncio.run(run_orchestrator_with_web(config, port=port))
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user[/yellow]")
 
 
 @main.command()

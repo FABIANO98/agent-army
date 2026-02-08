@@ -14,9 +14,16 @@ from ..db.database import Database
 from ..db.models import EmailStatus
 
 if TYPE_CHECKING:
+    from ..core.llm_service import LLMService
     from ..core.message_bus import MessageBus
     from ..core.registry import AgentRegistry
     from ..utils.config import Settings
+
+
+QC_SYSTEM_PROMPT = """Du bist ein Qualitaetskontrolleur fuer B2B-Kaltakquise-Emails an Schweizer KMUs.
+Bewerte die Email ganzheitlich und gib eine strukturierte Bewertung.
+Pruefe: Personalisierung, Professionalitaet, Spam-Risiko, Call-to-Action, Laenge, Tonalitaet.
+Antworte NUR mit validem JSON."""
 
 
 class QualityControlAgent(BaseAgent):
@@ -38,6 +45,7 @@ class QualityControlAgent(BaseAgent):
         registry: Optional[AgentRegistry] = None,
         database: Optional[Database] = None,
         settings: Optional[Settings] = None,
+        llm_service: Optional[LLMService] = None,
     ) -> None:
         """Initialize QualityControl agent."""
         super().__init__(
@@ -48,6 +56,7 @@ class QualityControlAgent(BaseAgent):
         )
         self._db = database
         self._settings = settings
+        self._llm = llm_service
         self._http_client: Optional[httpx.AsyncClient] = None
         self._pending_emails: list[dict[str, Any]] = []
 
@@ -164,7 +173,19 @@ class QualityControlAgent(BaseAgent):
 
     async def process_message(self, message: Message) -> None:
         """Process incoming messages."""
-        if message.message_type == MessageType.EMAIL_QUALITY_CHECK.value:
+        if message.message_type == MessageType.TASK_ASSIGNED.value:
+            task_id = message.payload.get("task_id")
+            subtask_id = message.payload.get("subtask_id")
+            await self.send_message(
+                recipient_id="task_manager",
+                message_type=MessageType.TASK_SUBTASK_COMPLETE.value,
+                payload={
+                    "task_id": task_id, "subtask_id": subtask_id,
+                    "output_data": {"type": "qc", "title": "Qualitaetskontrolle ausgefuehrt"},
+                },
+            )
+
+        elif message.message_type == MessageType.EMAIL_QUALITY_CHECK.value:
             # Add to review queue
             self._pending_emails.append(message.payload)
             self.log(
@@ -190,6 +211,13 @@ class QualityControlAgent(BaseAgent):
         Returns:
             Quality report dict with approval status and issues
         """
+        # Try LLM-based holistic review first
+        if self._llm:
+            llm_result = await self._check_quality_with_llm(email_draft, prospect, profile)
+            if llm_result:
+                return llm_result
+
+        # Fallback to heuristic checks
         issues: list[str] = []
         suggestions: list[str] = []
         scores: dict[str, float] = {}
@@ -423,6 +451,62 @@ class QualityControlAgent(BaseAgent):
             self.log(f"Grammar check failed: {e}", level="DEBUG")
 
         return {"errors": []}
+
+    async def _check_quality_with_llm(
+        self,
+        email_draft: dict[str, Any],
+        prospect: dict[str, Any],
+        profile: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """Holistic quality check using Claude."""
+        if not self._llm:
+            return None
+
+        try:
+            result = await self._llm.complete_structured(
+                prompt=f"""Bewerte diese Kaltakquise-Email:
+
+Betreff: {email_draft.get('subject', '')}
+
+Text:
+{email_draft.get('body', '')}
+
+Empfaenger: {prospect.get('name', 'Unbekannt')} ({prospect.get('industry', '')})
+CEO: {profile.get('ceo_name', 'unbekannt')}""",
+                system=QC_SYSTEM_PROMPT,
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "approved": {"type": "boolean"},
+                        "total_score": {"type": "number"},
+                        "spam_score": {"type": "number"},
+                        "issues": {"type": "array", "items": {"type": "string"}},
+                        "suggestions": {"type": "array", "items": {"type": "string"}},
+                        "scores": {
+                            "type": "object",
+                            "properties": {
+                                "personalization": {"type": "number"},
+                                "professionalism": {"type": "number"},
+                                "cta": {"type": "number"},
+                                "length": {"type": "number"},
+                                "spam": {"type": "number"},
+                            },
+                        },
+                    },
+                    "required": ["approved", "total_score", "issues"],
+                },
+                agent_id="quality_control",
+            )
+            if result:
+                result.setdefault("suggestions", [])
+                result.setdefault("spam_score", 0)
+                result.setdefault("word_count", len(email_draft.get("body", "").split()))
+                result.setdefault("suggested_variant", 2 if not result["approved"] else None)
+                return result
+        except Exception as e:
+            self.log(f"LLM quality check failed: {e}", level="WARNING")
+
+        return None
 
     def _check_subject_line(self, subject: str) -> dict[str, Any]:
         """Check subject line quality."""

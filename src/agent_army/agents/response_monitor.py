@@ -16,9 +16,16 @@ from ..db.models import ResponseCategory, ProspectStatus, DealStage
 
 if TYPE_CHECKING:
     from aioimaplib import IMAP4_SSL
+    from ..core.llm_service import LLMService
     from ..core.message_bus import MessageBus
     from ..core.registry import AgentRegistry
     from ..utils.config import Settings
+
+
+RESPONSE_MONITOR_SYSTEM_PROMPT = """Du bist ein Experte fuer die Analyse von Email-Antworten im B2B-Kontext.
+Kategorisiere die Antwort und extrahiere relevante Informationen.
+Kategorien: positive, negative, question, neutral, out_of_office
+Antworte NUR mit validem JSON."""
 
 
 class ResponseMonitorAgent(BaseAgent):
@@ -39,6 +46,7 @@ class ResponseMonitorAgent(BaseAgent):
         registry: Optional[AgentRegistry] = None,
         database: Optional[Database] = None,
         settings: Optional[Settings] = None,
+        llm_service: Optional[LLMService] = None,
     ) -> None:
         """Initialize ResponseMonitor agent."""
         super().__init__(
@@ -49,6 +57,7 @@ class ResponseMonitorAgent(BaseAgent):
         )
         self._db = database
         self._settings = settings
+        self._llm = llm_service
         self._last_check: Optional[datetime] = None
 
         # IMAP configuration
@@ -100,7 +109,19 @@ class ResponseMonitorAgent(BaseAgent):
 
     async def process_message(self, message: Message) -> None:
         """Process incoming messages."""
-        if message.message_type == MessageType.HEALTH_CHECK.value:
+        if message.message_type == MessageType.TASK_ASSIGNED.value:
+            task_id = message.payload.get("task_id")
+            subtask_id = message.payload.get("subtask_id")
+            await self.send_message(
+                recipient_id="task_manager",
+                message_type=MessageType.TASK_SUBTASK_COMPLETE.value,
+                payload={
+                    "task_id": task_id, "subtask_id": subtask_id,
+                    "output_data": {"type": "monitor", "title": "Inbox geprueft"},
+                },
+            )
+
+        elif message.message_type == MessageType.HEALTH_CHECK.value:
             await self.send_message(
                 recipient_id=message.sender_id,
                 message_type=MessageType.HEALTH_RESPONSE.value,
@@ -244,12 +265,26 @@ class ResponseMonitorAgent(BaseAgent):
             )
             return
 
-        # Categorize response
-        category = self._categorize_response(response)
-        sentiment = self._analyze_sentiment(response["body"])
-
-        # Extract key information
-        extracted = self._extract_info(response["body"])
+        # Use LLM for nuanced categorization if available
+        if self._llm:
+            llm_analysis = await self._analyze_response_with_llm(response)
+            if llm_analysis:
+                cat_str = llm_analysis.get("category", "neutral")
+                try:
+                    category = ResponseCategory(cat_str)
+                except ValueError:
+                    category = ResponseCategory.NEUTRAL
+                sentiment = llm_analysis.get("sentiment", "neutral")
+                extracted = llm_analysis.get("extracted_info", {})
+            else:
+                category = self._categorize_response(response)
+                sentiment = self._analyze_sentiment(response["body"])
+                extracted = self._extract_info(response["body"])
+        else:
+            # Fallback to heuristic categorization
+            category = self._categorize_response(response)
+            sentiment = self._analyze_sentiment(response["body"])
+            extracted = self._extract_info(response["body"])
 
         self.log(
             f"Response from {response.get('from_name', response.get('from_email'))}: "
@@ -475,6 +510,48 @@ class ResponseMonitorAgent(BaseAgent):
         elif negative_count > positive_count:
             return "negative"
         return "neutral"
+
+    async def _analyze_response_with_llm(
+        self, response: dict[str, Any]
+    ) -> Optional[dict[str, Any]]:
+        """Use Claude for nuanced response categorization and sentiment analysis."""
+        if not self._llm:
+            return None
+
+        try:
+            return await self._llm.complete_structured(
+                prompt=f"""Analysiere diese Email-Antwort auf eine B2B-Kaltakquise:
+
+Betreff: {response.get('subject', '')}
+Von: {response.get('from_name', '')} <{response.get('from_email', '')}>
+
+Text:
+{response.get('body', '')[:3000]}""",
+                system=RESPONSE_MONITOR_SYSTEM_PROMPT,
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string", "enum": ["positive", "negative", "question", "neutral", "out_of_office"]},
+                        "sentiment": {"type": "string", "enum": ["positive", "negative", "neutral"]},
+                        "confidence": {"type": "number"},
+                        "summary": {"type": "string"},
+                        "extracted_info": {
+                            "type": "object",
+                            "properties": {
+                                "meeting_requested": {"type": "boolean"},
+                                "budget": {"type": "string"},
+                                "phone": {"type": "string"},
+                                "mentioned_times": {"type": "array", "items": {"type": "string"}},
+                            },
+                        },
+                    },
+                    "required": ["category", "sentiment"],
+                },
+                agent_id="response_monitor",
+            )
+        except Exception as e:
+            self.log(f"LLM response analysis failed: {e}", level="WARNING")
+            return None
 
     def _extract_info(self, text: str) -> dict[str, Any]:
         """Extract key information from response."""

@@ -38,6 +38,25 @@ Web: www.frascati-systems.ch
 """
 
 
+class LLMSettings(BaseSettings):
+    """LLM/Claude API configuration."""
+
+    api_key: str = ""
+    default_model: str = "claude-sonnet-4-5-20250929"
+    fast_model: str = "claude-haiku-4-5-20251001"
+    max_concurrent: int = 5
+    requests_per_minute: int = 50
+
+
+class ScrapingSettings(BaseSettings):
+    """Web scraping configuration."""
+
+    headless: bool = True
+    max_concurrent_pages: int = 3
+    request_delay: float = 2.0
+    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+
 class APISettings(BaseSettings):
     """API keys configuration."""
 
@@ -121,6 +140,8 @@ class Settings(BaseSettings):
     # Sub-settings
     email: EmailSettings = Field(default_factory=EmailSettings)
     api: APISettings = Field(default_factory=APISettings)
+    llm: LLMSettings = Field(default_factory=LLMSettings)
+    scraping: ScrapingSettings = Field(default_factory=ScrapingSettings)
     agents: AgentSettings = Field(default_factory=AgentSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)

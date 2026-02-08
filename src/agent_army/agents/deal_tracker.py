@@ -15,9 +15,15 @@ from ..db.database import Database
 from ..db.models import DealStage
 
 if TYPE_CHECKING:
+    from ..core.llm_service import LLMService
     from ..core.message_bus import MessageBus
     from ..core.registry import AgentRegistry
     from ..utils.config import Settings
+
+
+DEAL_TRACKER_SYSTEM_PROMPT = """Du bist ein Sales-Analyst fuer Schweizer KMU-Vertrieb.
+Erstelle narrative Reports und Next-Step-Empfehlungen basierend auf Pipeline-Daten.
+Antworte NUR mit validem JSON."""
 
 
 class DealTrackerAgent(BaseAgent):
@@ -38,6 +44,7 @@ class DealTrackerAgent(BaseAgent):
         registry: Optional[AgentRegistry] = None,
         database: Optional[Database] = None,
         settings: Optional[Settings] = None,
+        llm_service: Optional[LLMService] = None,
     ) -> None:
         """Initialize DealTracker agent."""
         super().__init__(
@@ -48,6 +55,7 @@ class DealTrackerAgent(BaseAgent):
         )
         self._db = database
         self._settings = settings
+        self._llm = llm_service
         self._console = Console()
         self._last_report_date: Optional[datetime] = None
         self._last_stale_check: Optional[datetime] = None
@@ -79,7 +87,22 @@ class DealTrackerAgent(BaseAgent):
 
     async def process_message(self, message: Message) -> None:
         """Process incoming messages."""
-        if message.message_type == MessageType.EMAIL_SENT.value:
+        if message.message_type == MessageType.TASK_ASSIGNED.value:
+            task_id = message.payload.get("task_id")
+            subtask_id = message.payload.get("subtask_id")
+            report = {}
+            if self._db:
+                report = await self._db.get_daily_report()
+            await self.send_message(
+                recipient_id="task_manager",
+                message_type=MessageType.TASK_SUBTASK_COMPLETE.value,
+                payload={
+                    "task_id": task_id, "subtask_id": subtask_id,
+                    "output_data": {"type": "report", "title": "Pipeline Report", "data": report},
+                },
+            )
+
+        elif message.message_type == MessageType.EMAIL_SENT.value:
             # Track sent email
             prospect_id = message.payload.get("prospect", {}).get("id")
             if prospect_id:
@@ -137,8 +160,11 @@ class DealTrackerAgent(BaseAgent):
             report = await self._db.get_daily_report()
             pipeline = await self._db.get_pipeline_stats()
 
-            # Format report
-            report_text = self._format_report(report, pipeline)
+            # Format report - use LLM for narrative if available
+            if self._llm:
+                report_text = await self._generate_narrative_report(report, pipeline)
+            else:
+                report_text = self._format_report(report, pipeline)
 
             # Log the report
             self.log(f"Daily Report:\n{report_text}")
@@ -221,6 +247,61 @@ class DealTrackerAgent(BaseAgent):
             lines.append(f"Win Rate: {win_rate:.1f}%")
 
         return "\n".join(lines)
+
+    async def _generate_narrative_report(
+        self, report: dict[str, Any], pipeline: dict[str, Any]
+    ) -> str:
+        """Generate a narrative report using Claude."""
+        if not self._llm:
+            return self._format_report(report, pipeline)
+
+        try:
+            import json
+            result = await self._llm.complete_structured(
+                prompt=f"""Erstelle einen kurzen narrativen Tagesbericht:
+
+Tages-Aktivitaet:
+{json.dumps(report, indent=2, default=str)}
+
+Pipeline-Status:
+{json.dumps(pipeline, indent=2, default=str)}""",
+                system=DEAL_TRACKER_SYSTEM_PROMPT,
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "highlights": {"type": "array", "items": {"type": "string"}},
+                        "recommendations": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["summary"],
+                },
+                agent_id="deal_tracker",
+            )
+
+            if result:
+                lines = [
+                    f"\n{'='*50}",
+                    f"DAILY REPORT - {report.get('date', 'today')}",
+                    f"{'='*50}",
+                    "",
+                    result.get("summary", ""),
+                    "",
+                ]
+                if result.get("highlights"):
+                    lines.append("HIGHLIGHTS:")
+                    for h in result["highlights"]:
+                        lines.append(f"  * {h}")
+                    lines.append("")
+                if result.get("recommendations"):
+                    lines.append("NEXT STEPS:")
+                    for r in result["recommendations"]:
+                        lines.append(f"  → {r}")
+                lines.append(f"{'='*50}")
+                return "\n".join(lines)
+        except Exception as e:
+            self.log(f"LLM report generation failed: {e}", level="WARNING")
+
+        return self._format_report(report, pipeline)
 
     async def _check_stale_leads(self) -> None:
         """Check for and handle stale leads."""

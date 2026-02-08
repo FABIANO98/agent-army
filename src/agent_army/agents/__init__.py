@@ -8,6 +8,7 @@ from .email_sender import EmailSenderAgent
 from .response_monitor import ResponseMonitorAgent
 from .response_writer import ResponseWriterAgent
 from .deal_tracker import DealTrackerAgent
+from .task_manager import TaskManagerAgent
 
 __all__ = [
     "ProspectFinderAgent",
@@ -18,4 +19,5 @@ __all__ = [
     "ResponseMonitorAgent",
     "ResponseWriterAgent",
     "DealTrackerAgent",
+    "TaskManagerAgent",
 ]

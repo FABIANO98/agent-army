@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from .models import (
+    AgentCommunication,
     AgentLog,
     Base,
     CompanyProfile,
@@ -26,6 +27,10 @@ from .models import (
     ProspectStatus,
     Response,
     ResponseCategory,
+    Subtask,
+    Task,
+    TaskResult,
+    TaskStatus,
 )
 
 
@@ -552,4 +557,196 @@ class Database:
                 "responses_received": responses_result.scalar() or 0,
                 "positive_responses": positive_result.scalar() or 0,
                 "pipeline": pipeline,
+            }
+
+    # ==================== Task Operations ====================
+
+    async def create_task(
+        self, title: str, description: Optional[str] = None, priority: int = 5
+    ) -> Task:
+        """Create a new task."""
+        async with self.session() as session:
+            task = Task(title=title, description=description, priority=priority)
+            session.add(task)
+            await session.flush()
+            return task
+
+    async def get_task(self, task_id: int) -> Optional[Task]:
+        """Get a task by ID with subtasks and results."""
+        async with self.session() as session:
+            result = await session.execute(select(Task).where(Task.id == task_id))
+            return result.scalar_one_or_none()
+
+    async def update_task(self, task_id: int, **kwargs: Any) -> Optional[Task]:
+        """Update a task's fields."""
+        async with self.session() as session:
+            result = await session.execute(select(Task).where(Task.id == task_id))
+            task = result.scalar_one_or_none()
+            if task:
+                for key, value in kwargs.items():
+                    if hasattr(task, key):
+                        setattr(task, key, value)
+                task.updated_at = datetime.now()
+            return task
+
+    async def list_tasks(
+        self,
+        status: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Sequence[Task]:
+        """List tasks with optional status filter."""
+        async with self.session() as session:
+            query = select(Task)
+            if status:
+                query = query.where(Task.status == status)
+            query = query.order_by(Task.created_at.desc()).limit(limit).offset(offset)
+            result = await session.execute(query)
+            return result.scalars().all()
+
+    async def create_subtask(
+        self,
+        task_id: int,
+        title: str,
+        description: Optional[str] = None,
+        assigned_agent: Optional[str] = None,
+        sequence_order: int = 0,
+        depends_on: Optional[list[int]] = None,
+        input_data: Optional[dict[str, Any]] = None,
+    ) -> Subtask:
+        """Create a subtask for a task."""
+        async with self.session() as session:
+            subtask = Subtask(
+                task_id=task_id,
+                title=title,
+                description=description,
+                assigned_agent=assigned_agent,
+                sequence_order=sequence_order,
+                depends_on=depends_on,
+                input_data=input_data,
+            )
+            session.add(subtask)
+            await session.flush()
+            return subtask
+
+    async def update_subtask(self, subtask_id: int, **kwargs: Any) -> Optional[Subtask]:
+        """Update a subtask."""
+        async with self.session() as session:
+            result = await session.execute(select(Subtask).where(Subtask.id == subtask_id))
+            subtask = result.scalar_one_or_none()
+            if subtask:
+                for key, value in kwargs.items():
+                    if hasattr(subtask, key):
+                        setattr(subtask, key, value)
+            return subtask
+
+    async def get_subtasks(self, task_id: int) -> Sequence[Subtask]:
+        """Get all subtasks for a task."""
+        async with self.session() as session:
+            result = await session.execute(
+                select(Subtask)
+                .where(Subtask.task_id == task_id)
+                .order_by(Subtask.sequence_order)
+            )
+            return result.scalars().all()
+
+    async def create_task_result(
+        self,
+        task_id: int,
+        result_type: str = "text",
+        title: Optional[str] = None,
+        data: Optional[dict[str, Any]] = None,
+    ) -> TaskResult:
+        """Create a result entry for a task."""
+        async with self.session() as session:
+            task_result = TaskResult(
+                task_id=task_id,
+                result_type=result_type,
+                title=title,
+                data=data,
+            )
+            session.add(task_result)
+            await session.flush()
+            return task_result
+
+    async def get_task_results(self, task_id: int) -> Sequence[TaskResult]:
+        """Get all results for a task."""
+        async with self.session() as session:
+            result = await session.execute(
+                select(TaskResult).where(TaskResult.task_id == task_id)
+            )
+            return result.scalars().all()
+
+    async def log_agent_communication(
+        self,
+        sender_agent: str,
+        receiver_agent: str,
+        message_type: str,
+        summary: Optional[str] = None,
+        task_id: Optional[int] = None,
+    ) -> None:
+        """Log an agent communication event."""
+        async with self.session() as session:
+            comm = AgentCommunication(
+                sender_agent=sender_agent,
+                receiver_agent=receiver_agent,
+                message_type=message_type,
+                summary=summary,
+                task_id=task_id,
+            )
+            session.add(comm)
+
+    async def get_communications(
+        self, limit: int = 100, task_id: Optional[int] = None
+    ) -> Sequence[AgentCommunication]:
+        """Get agent communications."""
+        async with self.session() as session:
+            query = select(AgentCommunication)
+            if task_id:
+                query = query.where(AgentCommunication.task_id == task_id)
+            query = query.order_by(AgentCommunication.timestamp.desc()).limit(limit)
+            result = await session.execute(query)
+            return result.scalars().all()
+
+    async def get_dashboard_stats(self) -> dict[str, Any]:
+        """Get aggregated dashboard statistics."""
+        async with self.session() as session:
+            # Active tasks
+            active_tasks = await session.execute(
+                select(func.count())
+                .select_from(Task)
+                .where(Task.status.in_([TaskStatus.IN_PROGRESS.value, TaskStatus.PLANNING.value]))
+            )
+
+            # Total tasks
+            total_tasks = await session.execute(
+                select(func.count()).select_from(Task)
+            )
+
+            # Pipeline value
+            pipeline_value = await session.execute(
+                select(func.sum(Deal.value))
+                .select_from(Deal)
+                .where(Deal.stage.not_in([DealStage.LOST.value, DealStage.WON.value]))
+            )
+
+            # Emails sent today
+            today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            emails_today = await session.execute(
+                select(func.count())
+                .select_from(Email)
+                .where(Email.sent_at >= today_start, Email.status == EmailStatus.SENT.value)
+            )
+
+            # Total prospects
+            total_prospects = await session.execute(
+                select(func.count()).select_from(Prospect)
+            )
+
+            return {
+                "active_tasks": active_tasks.scalar() or 0,
+                "total_tasks": total_tasks.scalar() or 0,
+                "pipeline_value": pipeline_value.scalar() or 0,
+                "emails_today": emails_today.scalar() or 0,
+                "total_prospects": total_prospects.scalar() or 0,
             }

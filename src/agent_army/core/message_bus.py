@@ -43,6 +43,15 @@ class MessageType(str, Enum):
     DEAL_STAGE_UPDATE = "deal_stage_update"
     DEAL_ALERT = "deal_alert"
 
+    # Task management
+    TASK_CREATED = "task_created"
+    TASK_PLAN_READY = "task_plan_ready"
+    TASK_ASSIGNED = "task_assigned"
+    TASK_PROGRESS = "task_progress"
+    TASK_SUBTASK_COMPLETE = "task_subtask_complete"
+    TASK_COMPLETED = "task_completed"
+    TASK_FAILED = "task_failed"
+
     # System
     HEALTH_CHECK = "health_check"
     HEALTH_RESPONSE = "health_response"

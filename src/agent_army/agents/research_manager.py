@@ -17,9 +17,17 @@ from ..db.database import Database
 from ..db.models import ProspectStatus
 
 if TYPE_CHECKING:
+    from ..core.llm_service import LLMService
     from ..core.message_bus import MessageBus
     from ..core.registry import AgentRegistry
+    from ..scrapers.browser_manager import BrowserManager
+    from ..scrapers.website_analyzer import WebsiteAnalyzer
     from ..utils.config import Settings
+
+
+RESEARCH_SYSTEM_PROMPT = """Du bist ein erfahrener Business-Researcher fuer Schweizer KMUs.
+Analysiere die gegebene Webseite und extrahiere strukturierte Informationen.
+Antworte NUR mit validem JSON."""
 
 
 class ResearchManagerAgent(BaseAgent):
@@ -40,6 +48,9 @@ class ResearchManagerAgent(BaseAgent):
         registry: Optional[AgentRegistry] = None,
         database: Optional[Database] = None,
         settings: Optional[Settings] = None,
+        llm_service: Optional[LLMService] = None,
+        browser_manager: Optional[BrowserManager] = None,
+        website_analyzer: Optional[WebsiteAnalyzer] = None,
     ) -> None:
         """Initialize ResearchManager agent."""
         super().__init__(
@@ -50,6 +61,9 @@ class ResearchManagerAgent(BaseAgent):
         )
         self._db = database
         self._settings = settings
+        self._llm = llm_service
+        self._browser = browser_manager
+        self._analyzer = website_analyzer
         self._http_client: Optional[httpx.AsyncClient] = None
         self._pending_prospects: list[dict[str, Any]] = []
         self._max_per_batch = 5
@@ -166,7 +180,10 @@ class ResearchManagerAgent(BaseAgent):
 
     async def process_message(self, message: Message) -> None:
         """Process incoming messages."""
-        if message.message_type == MessageType.NEW_PROSPECTS.value:
+        if message.message_type == MessageType.TASK_ASSIGNED.value:
+            await self._execute_subtask(message.payload)
+
+        elif message.message_type == MessageType.NEW_PROSPECTS.value:
             # Add new prospects to queue
             prospects = message.payload.get("prospects", [])
             self._pending_prospects.extend(prospects)
@@ -180,6 +197,45 @@ class ResearchManagerAgent(BaseAgent):
                 recipient_id=message.sender_id,
                 message_type=MessageType.HEALTH_RESPONSE.value,
                 payload=await self.health_check(),
+            )
+
+    async def _execute_subtask(self, payload: dict[str, Any]) -> None:
+        """Execute a subtask assigned by TaskManager."""
+        task_id = payload.get("task_id")
+        subtask_id = payload.get("subtask_id")
+        self.log(f"Executing subtask #{subtask_id} for task #{task_id}")
+
+        try:
+            if self._pending_prospects:
+                batch = self._pending_prospects[:self._max_per_batch]
+                self._pending_prospects = self._pending_prospects[self._max_per_batch:]
+                results = []
+                for p in batch:
+                    profile = await self._research_prospect(p)
+                    if profile:
+                        results.append(profile)
+            else:
+                results = []
+
+            await self.send_message(
+                recipient_id="task_manager",
+                message_type=MessageType.TASK_SUBTASK_COMPLETE.value,
+                payload={
+                    "task_id": task_id,
+                    "subtask_id": subtask_id,
+                    "output_data": {
+                        "type": "research",
+                        "title": f"{len(results)} Profile recherchiert",
+                        "profiles": results,
+                        "count": len(results),
+                    },
+                },
+            )
+        except Exception as e:
+            await self.send_message(
+                recipient_id="task_manager",
+                message_type=MessageType.TASK_FAILED.value,
+                payload={"task_id": task_id, "subtask_id": subtask_id, "error": str(e)},
             )
 
     async def _research_prospect(self, prospect: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -228,17 +284,29 @@ class ResearchManagerAgent(BaseAgent):
                 main_page, prospect.get("website_signals", [])
             )
 
-            # Identify buying signals
+            # If LLM available, do a Claude-enhanced analysis
             all_content = (main_page or "") + (about_page or "") + (contact_page or "")
+            if self._llm and all_content:
+                llm_profile = await self._research_with_llm(url, all_content, prospect)
+                if llm_profile:
+                    # Merge LLM results (LLM overrides heuristic where present)
+                    for key in ["ceo_name", "ceo_email", "employees_count",
+                                "founding_year", "buying_signals", "pain_points",
+                                "budget_estimate", "sentiment_score"]:
+                        if llm_profile.get(key):
+                            profile[key] = llm_profile[key]
+                    # Append LLM-found problems
+                    if llm_profile.get("website_problems"):
+                        existing = set(profile.get("website_problems", []))
+                        for p in llm_profile["website_problems"]:
+                            if p not in existing:
+                                profile.setdefault("website_problems", []).append(p)
+                    return profile
+
+            # Fallback to heuristic analysis
             profile["buying_signals"] = self._identify_buying_signals(all_content)
-
-            # Estimate budget based on company size indicators
             profile["budget_estimate"] = self._estimate_budget(profile, all_content)
-
-            # Calculate sentiment score (1-10 how "hot" the lead is)
             profile["sentiment_score"] = self._calculate_sentiment_score(profile)
-
-            # Identify pain points
             profile["pain_points"] = self._identify_pain_points(
                 profile.get("website_problems", []),
                 prospect.get("industry", ""),
@@ -250,8 +318,53 @@ class ResearchManagerAgent(BaseAgent):
             self.log(f"Research error for {url}: {e}", level="WARNING")
             return None
 
+    async def _research_with_llm(
+        self, url: str, content: str, prospect: dict[str, Any]
+    ) -> Optional[dict[str, Any]]:
+        """Use Claude to perform deep research analysis."""
+        if not self._llm:
+            return None
+
+        content_truncated = content[:8000]
+        try:
+            return await self._llm.complete_structured(
+                prompt=f"""Analysiere diese Webseite eines Schweizer KMU:
+URL: {url}
+Branche: {prospect.get('industry', 'unbekannt')}
+Region: {prospect.get('region', 'Schweiz')}
+
+Website-Inhalt:
+{content_truncated}""",
+                system=RESEARCH_SYSTEM_PROMPT,
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "ceo_name": {"type": "string"},
+                        "ceo_email": {"type": "string"},
+                        "employees_count": {"type": "integer"},
+                        "founding_year": {"type": "integer"},
+                        "website_problems": {"type": "array", "items": {"type": "string"}},
+                        "buying_signals": {"type": "array", "items": {"type": "string"}},
+                        "pain_points": {"type": "array", "items": {"type": "string"}},
+                        "budget_estimate": {"type": "string"},
+                        "sentiment_score": {"type": "number"},
+                    },
+                },
+                agent_id="research_manager",
+            )
+        except Exception as e:
+            self.log(f"LLM research failed: {e}", level="WARNING")
+            return None
+
     async def _fetch_page(self, url: str) -> Optional[str]:
-        """Fetch a webpage and return HTML content."""
+        """Fetch a webpage - tries Playwright first, then httpx."""
+        # Try browser manager for JS-heavy pages
+        if self._browser and self._browser.is_available:
+            content = await self._browser.get_page_content(url)
+            if content:
+                return content
+
+        # Fallback to httpx
         if not self._http_client:
             return None
 

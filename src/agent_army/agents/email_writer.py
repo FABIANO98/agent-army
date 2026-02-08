@@ -13,9 +13,22 @@ from ..db.models import EmailStatus
 from ..templates.email_templates import EmailTemplateManager
 
 if TYPE_CHECKING:
+    from ..core.llm_service import LLMService
     from ..core.message_bus import MessageBus
     from ..core.registry import AgentRegistry
     from ..utils.config import Settings
+
+
+EMAIL_WRITER_SYSTEM_PROMPT = """Du bist ein erfahrener B2B Email-Copywriter fuer Schweizer KMUs.
+Du schreibst personalisierte Kaltakquise-Emails auf Deutsch (Schweizer Hochdeutsch).
+Die Emails sollen:
+- Professionell aber persoenlich sein
+- Konkrete Probleme der Webseite ansprechen
+- Einen klaren Nutzen kommunizieren
+- Kurz und praegnant sein (150-250 Woerter)
+- Einen klaren Call-to-Action haben
+- Den CEO/Geschaeftsfuehrer direkt ansprechen
+Antworte NUR mit validem JSON."""
 
 
 class EmailWriterAgent(BaseAgent):
@@ -35,6 +48,7 @@ class EmailWriterAgent(BaseAgent):
         registry: Optional[AgentRegistry] = None,
         database: Optional[Database] = None,
         settings: Optional[Settings] = None,
+        llm_service: Optional[LLMService] = None,
     ) -> None:
         """Initialize EmailWriter agent."""
         super().__init__(
@@ -45,6 +59,7 @@ class EmailWriterAgent(BaseAgent):
         )
         self._db = database
         self._settings = settings
+        self._llm = llm_service
         self._template_manager = EmailTemplateManager()
         self._pending_profiles: list[dict[str, Any]] = []
         self._signature = ""
@@ -125,7 +140,10 @@ class EmailWriterAgent(BaseAgent):
 
     async def process_message(self, message: Message) -> None:
         """Process incoming messages."""
-        if message.message_type == MessageType.PROSPECT_RESEARCH_COMPLETE.value:
+        if message.message_type == MessageType.TASK_ASSIGNED.value:
+            await self._execute_subtask(message.payload)
+
+        elif message.message_type == MessageType.PROSPECT_RESEARCH_COMPLETE.value:
             # Receive researched profiles
             profiles = message.payload.get("profiles", [])
             self._pending_profiles.extend(profiles)
@@ -153,6 +171,35 @@ class EmailWriterAgent(BaseAgent):
                 payload=await self.health_check(),
             )
 
+    async def _execute_subtask(self, payload: dict[str, Any]) -> None:
+        """Execute a subtask assigned by TaskManager."""
+        task_id = payload.get("task_id")
+        subtask_id = payload.get("subtask_id")
+        self.log(f"Executing subtask #{subtask_id} for task #{task_id}")
+        try:
+            count = 0
+            for data in self._pending_profiles[:5]:
+                prospect = data.get("prospect", {})
+                profile = data.get("profile", data)
+                draft = await self._write_email(prospect, profile)
+                if draft:
+                    count += 1
+            await self.send_message(
+                recipient_id="task_manager",
+                message_type=MessageType.TASK_SUBTASK_COMPLETE.value,
+                payload={
+                    "task_id": task_id,
+                    "subtask_id": subtask_id,
+                    "output_data": {"type": "emails", "title": f"{count} Emails geschrieben", "count": count},
+                },
+            )
+        except Exception as e:
+            await self.send_message(
+                recipient_id="task_manager",
+                message_type=MessageType.TASK_FAILED.value,
+                payload={"task_id": task_id, "subtask_id": subtask_id, "error": str(e)},
+            )
+
     async def _write_email(
         self, prospect: dict[str, Any], profile: dict[str, Any]
     ) -> Optional[dict[str, Any]]:
@@ -166,6 +213,13 @@ class EmailWriterAgent(BaseAgent):
         Returns:
             Email draft dict with subject, body, and metadata
         """
+        # Try Claude-powered email writing first
+        if self._llm:
+            llm_result = await self._write_email_with_llm(prospect, profile)
+            if llm_result:
+                return llm_result
+
+        # Fallback to template-based writing
         # Extract key information
         ceo_name = profile.get("ceo_name", "")
         firma_name = prospect.get("name", "Ihre Firma")
@@ -317,6 +371,58 @@ Falls Sie Interesse haben, stehe ich gerne für ein unverbindliches Gespräch zu
 {context['signature']}"""
 
         return subject, body
+
+    async def _write_email_with_llm(
+        self, prospect: dict[str, Any], profile: dict[str, Any]
+    ) -> Optional[dict[str, Any]]:
+        """Write a personalized email using Claude."""
+        if not self._llm:
+            return None
+
+        try:
+            result = await self._llm.complete_structured(
+                prompt=f"""Schreibe eine personalisierte Kaltakquise-Email fuer:
+
+Firma: {prospect.get('name', 'Unbekannt')}
+Branche: {prospect.get('industry', '')}
+Region: {prospect.get('region', 'Schweiz')}
+CEO/Ansprechperson: {profile.get('ceo_name', 'unbekannt')}
+Webseite-Probleme: {', '.join(profile.get('website_problems', [])[:3]) or 'keine bekannt'}
+Buying Signals: {', '.join(profile.get('buying_signals', [])[:3]) or 'keine'}
+Pain Points: {', '.join(profile.get('pain_points', [])[:3]) or 'keine bekannt'}
+
+Signatur: {self._signature}""",
+                system=EMAIL_WRITER_SYSTEM_PROMPT,
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "subject": {"type": "string"},
+                        "body": {"type": "string"},
+                    },
+                    "required": ["subject", "body"],
+                },
+                agent_id="email_writer",
+            )
+
+            if result and result.get("subject") and result.get("body"):
+                return {
+                    "subject": result["subject"],
+                    "body": result["body"],
+                    "prospect_id": prospect.get("id"),
+                    "personalization_score": self._calculate_personalization_score(
+                        result["body"],
+                        profile.get("ceo_name", ""),
+                        prospect.get("name", ""),
+                        profile.get("website_problems", []),
+                    ),
+                    "word_count": len(result["body"].split()),
+                    "template_variant": 0,  # LLM-generated
+                    "created_at": datetime.now().isoformat(),
+                }
+        except Exception as e:
+            self.log(f"LLM email writing failed: {e}", level="WARNING")
+
+        return None
 
     def _calculate_personalization_score(
         self,

@@ -13,9 +13,17 @@ from ..db.models import ResponseCategory
 from ..templates.email_templates import EmailTemplateManager
 
 if TYPE_CHECKING:
+    from ..core.llm_service import LLMService
     from ..core.message_bus import MessageBus
     from ..core.registry import AgentRegistry
     from ..utils.config import Settings
+
+
+RESPONSE_WRITER_SYSTEM_PROMPT = """Du bist ein erfahrener B2B-Vertriebsexperte fuer Schweizer KMUs.
+Du schreibst kontextuelle, personalisierte Antworten auf Emails.
+Die Antworten sollen professionell, freundlich und zielgerichtet sein.
+Passe den Ton an die erhaltene Nachricht an.
+Antworte NUR mit validem JSON."""
 
 
 class ResponseWriterAgent(BaseAgent):
@@ -34,6 +42,7 @@ class ResponseWriterAgent(BaseAgent):
         registry: Optional[AgentRegistry] = None,
         database: Optional[Database] = None,
         settings: Optional[Settings] = None,
+        llm_service: Optional[LLMService] = None,
     ) -> None:
         """Initialize ResponseWriter agent."""
         super().__init__(
@@ -44,6 +53,7 @@ class ResponseWriterAgent(BaseAgent):
         )
         self._db = database
         self._settings = settings
+        self._llm = llm_service
         self._template_manager = EmailTemplateManager()
         self._pending_responses: list[dict[str, Any]] = []
         self._signature = ""
@@ -127,7 +137,19 @@ class ResponseWriterAgent(BaseAgent):
 
     async def process_message(self, message: Message) -> None:
         """Process incoming messages."""
-        if message.message_type == MessageType.RESPONSE_RECEIVED.value:
+        if message.message_type == MessageType.TASK_ASSIGNED.value:
+            task_id = message.payload.get("task_id")
+            subtask_id = message.payload.get("subtask_id")
+            await self.send_message(
+                recipient_id="task_manager",
+                message_type=MessageType.TASK_SUBTASK_COMPLETE.value,
+                payload={
+                    "task_id": task_id, "subtask_id": subtask_id,
+                    "output_data": {"type": "response", "title": "Antwort verfasst"},
+                },
+            )
+
+        elif message.message_type == MessageType.RESPONSE_RECEIVED.value:
             self._pending_responses.append(message.payload)
             category = message.payload.get("category", "unknown")
             self.log(
@@ -158,6 +180,15 @@ class ResponseWriterAgent(BaseAgent):
             if db_profile:
                 profile = db_profile.to_dict()
 
+        # Try LLM-powered contextual reply
+        if self._llm:
+            llm_reply = await self._write_reply_with_llm(
+                response, category, original_email, prospect, profile, extracted_info
+            )
+            if llm_reply:
+                return llm_reply
+
+        # Fallback to template-based replies
         ceo_name = profile.get("ceo_name", "")
         if ceo_name:
             ceo_last_name = ceo_name.split()[-1] if " " in ceo_name else ceo_name
@@ -273,6 +304,63 @@ Ich stehe Ihnen gerne zur Verfügung, falls Sie weitere Informationen benötigen
             "in_reply_to": original_email.get("message_id"),
             "created_at": datetime.now().isoformat(),
         }
+
+    async def _write_reply_with_llm(
+        self,
+        response: dict[str, Any],
+        category: str,
+        original_email: dict[str, Any],
+        prospect: dict[str, Any],
+        profile: dict[str, Any],
+        extracted_info: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """Write a contextual reply using Claude."""
+        if not self._llm:
+            return None
+
+        try:
+            time_slots = self._generate_time_slots()
+            result = await self._llm.complete_structured(
+                prompt=f"""Schreibe eine Antwort auf diese Email:
+
+Kategorie: {category}
+Empfaenger: {prospect.get('name', 'Unbekannt')}
+CEO: {profile.get('ceo_name', 'unbekannt')}
+
+Urspruengliche Email (Betreff): {original_email.get('subject', '')}
+
+Erhaltene Antwort:
+{response.get('response_text', response.get('body', ''))[:2000]}
+
+Extrahierte Infos: Meeting gewuenscht={extracted_info.get('meeting_requested', False)}, Budget={extracted_info.get('budget', 'unbekannt')}
+
+Verfuegbare Termine: {', '.join(time_slots[:3])}
+Signatur: {self._signature}""",
+                system=RESPONSE_WRITER_SYSTEM_PROMPT,
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "subject": {"type": "string"},
+                        "body": {"type": "string"},
+                    },
+                    "required": ["subject", "body"],
+                },
+                agent_id="response_writer",
+            )
+
+            if result and result.get("body"):
+                return {
+                    "subject": result.get("subject", f"Re: {original_email.get('subject', '')}"),
+                    "body": result["body"],
+                    "prospect_id": prospect.get("id"),
+                    "email_type": "response",
+                    "in_reply_to": original_email.get("message_id"),
+                    "created_at": datetime.now().isoformat(),
+                }
+        except Exception as e:
+            self.log(f"LLM reply writing failed: {e}", level="WARNING")
+
+        return None
 
     def _generate_meeting_proposal(
         self,
